@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
 
@@ -16,13 +17,14 @@ FILE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Content-Disposition filename extractor
-CD_FILENAME_RE = re.compile(
-    r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", re.IGNORECASE
-)
+# Content-Disposition filename extractor (basic)
+CD_FILENAME_RE = re.compile(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", re.IGNORECASE)
 
-# Input file rules
 ALLOWED_INPUT_FILE_EXTS = {".pdf"}
+
+DEFAULT_HEADERS = {
+    "User-Agent": "ACC-FinalResponse-Downloader/1.0",
+}
 
 
 def print_script_explanation() -> None:
@@ -33,13 +35,12 @@ REQUIRED FILE TYPE
 You must supply an ACC export named "Submittal item detail" (PDF).
 
 How to generate the PDF in ACC
-
-Access ACC -> Go to Submittals -> Select submittals to download -> Hit export -> Export as Submittal item detail
+ACC -> Submittals -> select submittals -> Export -> Export as "Submittal item detail"
 
 What the script does
 1) For each PDF, scans for the "Final Response" section and its "Attachments" block.
 2) Extracts Autodesk attachment URLs from the PDF link annotations.
-3) Pairs attachment URLs to the attachment names from the "Final Response" block.
+3) Pairs attachment URLs to attachment names from the "Final Response" block.
 4) Downloads each attachment.
 5) Normalises filenames and prevents duplicates by appending _1, _2, etc.
 
@@ -53,7 +54,9 @@ Output behaviour
     print()
 
 
-def get_filename_from_content_disposition(headers: requests.structures.CaseInsensitiveDict) -> Optional[str]:
+def get_filename_from_content_disposition(
+    headers: requests.structures.CaseInsensitiveDict,
+) -> Optional[str]:
     cd = headers.get("Content-Disposition", "")
     if not cd:
         return None
@@ -80,7 +83,6 @@ def is_valid_submittal_item_detail_pdf(pdf_path: Path) -> Tuple[bool, str]:
 
         text = reader.pages[0].extract_text() or ""
 
-        # Strong identifiers seen in real ACC exports
         required_markers = [
             "Submittal item detail",
             "Autodesk® Construction Cloud",
@@ -88,7 +90,11 @@ def is_valid_submittal_item_detail_pdf(pdf_path: Path) -> Tuple[bool, str]:
 
         missing = [m for m in required_markers if m not in text]
         if missing:
-            return False, f"PDF does not look like an ACC 'Submittal item detail' export (missing: {', '.join(missing)})"
+            return (
+                False,
+                "PDF does not look like an ACC 'Submittal item detail' export "
+                f"(missing: {', '.join(missing)})",
+            )
 
         return True, "OK"
 
@@ -109,7 +115,6 @@ def validate_input_path(input_path: Path) -> Tuple[bool, str]:
         if not pdfs:
             return False, f"Directory contains no PDFs: {input_path}"
 
-        # Require at least one valid Submittal item detail export in the folder
         for pdf in pdfs:
             ok, _ = is_valid_submittal_item_detail_pdf(pdf)
             if ok:
@@ -142,6 +147,9 @@ def prompt_for_output_base_folder(prompt_text: str) -> Path:
         p = Path(raw)
         try:
             p.mkdir(parents=True, exist_ok=True)
+            if not p.is_dir():
+                print(f"Output path is not a folder: {p}")
+                continue
             return p
         except Exception as exc:
             print(f"Could not create/access folder '{p}': {exc}")
@@ -227,7 +235,7 @@ def extract_final_response_attachment_links(pdf_path: Path) -> List[Tuple[str, O
 
             has_final_response = any(
                 j >= 0 and lines[j].startswith("Final Response")
-                for j in [idx - 1, idx - 2]
+                for j in (idx - 1, idx - 2)
             )
             if not has_final_response:
                 continue
@@ -293,59 +301,66 @@ def download_file(
     out_dir: Path,
     existing: Set[str],
     rename: bool = True,
+    retries: int = 3,
 ) -> Optional[str]:
-    try:
-        with requests.get(url, stream=True, timeout=60) as r:
-            r.raise_for_status()
+    last_exc: Optional[Exception] = None
 
-            name: Optional[str] = None
-            if display_name:
-                name = display_name.strip()
+    for attempt in range(1, retries + 1):
+        try:
+            with requests.get(url, stream=True, timeout=60, headers=DEFAULT_HEADERS) as r:
+                r.raise_for_status()
 
-            if not name:
-                cd_name = get_filename_from_content_disposition(r.headers)
-                if cd_name:
-                    name = cd_name
+                name: Optional[str] = display_name.strip() if display_name else None
 
-            if not name:
-                base_part = url.split("?", 1)[0].rstrip("/")
-                name = base_part.rsplit("/", 1)[-1] or "download.bin"
-                if "." not in name:
-                    name += ".bin"
+                if not name:
+                    cd_name = get_filename_from_content_disposition(r.headers)
+                    if cd_name:
+                        name = cd_name
 
-            final_name = normalise_filename(name) if rename else name
-            final_name = safe_filename(final_name, existing)
+                if not name:
+                    base_part = url.split("?", 1)[0].rstrip("/")
+                    name = base_part.rsplit("/", 1)[-1] or "download.bin"
+                    if "." not in name:
+                        name += ".bin"
 
-            dest = out_dir / final_name
+                final_name = normalise_filename(name) if rename else name
+                final_name = safe_filename(final_name, existing)
 
-            total = int(r.headers.get("content-length", 0))
-            downloaded = 0
+                dest = out_dir / final_name
 
-            print(f"      Saving as: {final_name}")
+                total = int(r.headers.get("content-length", 0))
+                downloaded = 0
 
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    downloaded += len(chunk)
+                print(f"      Saving as: {final_name}")
 
-                    if total > 0:
-                        percent = (downloaded / total) * 100
-                        print(f"\r      Downloading: {percent:6.2f}%", end="")
-                    else:
-                        print("\r      Downloading: (no size info)", end="")
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
 
-            if total > 0:
-                print("\r      Downloading: 100.00%   ")
-            else:
-                print("\r      Downloading: complete  ")
+                        if total > 0:
+                            percent = (downloaded / total) * 100
+                            print(f"\r      Downloading: {percent:6.2f}%", end="", flush=True)
+                        else:
+                            print("\r      Downloading: (no size info)", end="", flush=True)
 
-            return final_name
+                print("\r      Downloading: complete".ljust(40))
+                return final_name
 
-    except Exception as exc:
-        print(f"\n      ERROR downloading {url}: {exc}")
-        return None
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                sleep_s = 1.0 * attempt
+                print(f"\n      Download failed (attempt {attempt}/{retries}): {exc}")
+                print(f"      Retrying in {sleep_s:.1f}s...")
+                time.sleep(sleep_s)
+                continue
+            break
+
+    print(f"\n      ERROR downloading {url}: {last_exc}")
+    return None
 
 
 def gather_pdfs(input_path: Path) -> Iterable[Path]:
@@ -373,10 +388,7 @@ def process_pdf(pdf_path: Path, out_dir: Path, existing: Set[str]) -> None:
     total_links = len(links)
     for index, (url, display_name) in enumerate(links, start=1):
         print(f"  [{index}/{total_links}] URL: {url}")
-        if display_name:
-            print(f"      Display text: {display_name}")
-        else:
-            print("      No display text; will infer filename.")
+        print(f"      Display text: {display_name}" if display_name else "      No display text; will infer filename.")
         download_file(url, display_name, out_dir, existing)
 
 
@@ -385,22 +397,32 @@ def resolve_paths(argv: Optional[List[str]]) -> Tuple[Path, Path]:
         description="Bulk download 'Final Response' attachments from ACC 'Submittal item detail' PDFs."
     )
     parser.add_argument("input_path", type=Path, nargs="?", help="Path to a single PDF or a directory of PDFs.")
-    parser.add_argument("output_folder", type=Path, nargs="?", help="Destination base folder for downloads.")
+    parser.add_argument(
+        "output_base",
+        type=Path,
+        nargs="?",
+        help="Destination BASE folder. The script will create a subfolder named after the input.",
+    )
     args = parser.parse_args(argv)
 
     # CLI mode
-    if args.input_path and args.output_folder:
+    if args.input_path and args.output_base:
         ok, msg = validate_input_path(args.input_path)
         if not ok:
             print(msg)
             sys.exit(1)
-        return args.input_path, args.output_folder
+        return args.input_path, args.output_base
 
     # Interactive mode
     print_script_explanation()
     input_path = prompt_for_valid_input_path("Enter input PDF or folder: ")
     output_base = prompt_for_output_base_folder("Enter output base folder: ")
     return input_path, output_base
+
+
+def output_folder_name(input_path: Path) -> str:
+    # File => stem, Directory => name (more intuitive)
+    return input_path.stem if input_path.is_file() else input_path.name
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -423,14 +445,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         sys.exit(1)
 
     # Single output folder for all PDFs
-    download_folder = output_base / input_path.stem
+    download_folder = output_base / output_folder_name(input_path)
     download_folder.mkdir(parents=True, exist_ok=True)
 
     print(f"\nAll files will be saved to: {download_folder}\n")
 
     existing: Set[str] = set()
 
-    # If directory input, optionally skip invalid PDFs instead of failing hard
+    # If directory input, skip invalid PDFs instead of failing hard
     for pdf in pdfs:
         ok, msg = is_valid_submittal_item_detail_pdf(pdf)
         if not ok:
@@ -441,4 +463,9 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n[FATAL] {e}")
+        input("Press Enter to exit...")
+        raise
