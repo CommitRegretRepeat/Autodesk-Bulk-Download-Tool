@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bulk-dlr"
+version = "0.1.0"
+description = "Bulk downloader for Autodesk Construction Cloud Final Response attachments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "pypdf",
+]
+
+[project.scripts]
+bulk-dlr = "bulk_dlr.main:main"
+
+[tool.setuptools]
+packages = ["bulk_dlr"]
